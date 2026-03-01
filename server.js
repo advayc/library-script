@@ -69,6 +69,12 @@ function runBooking(date, capacity, onData, onDone) {
   child.stdout.on('data', d => onData(d.toString()));
   child.stderr.on('data', d => onData('[stderr] ' + d.toString()));
   child.on('close', code => onDone(code));
+  child.on('error', err => {
+    try {
+      onData('[error] spawn failed: ' + (err && err.message ? err.message : String(err)) + '\n');
+    } catch {}
+    try { onDone(127); } catch {}
+  });
 }
 
 // --- background job store (in-memory) ---
@@ -95,7 +101,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const body = await readBody(req);
+    let body = {};
+    try {
+      body = await readBody(req);
+    } catch (e) {
+      console.error('Error parsing request body:', e && e.stack ? e.stack : e);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body', detail: String(e && e.message ? e.message : e) }));
+      return;
+    }
     const date     = (body.date || '').trim();
     const capacity = Number(body.capacity) || 4;
 
@@ -181,4 +195,12 @@ server.listen(PORT, () => {
   if (!API_TOKEN) {
     console.warn('WARNING: API_TOKEN is not set. The /book endpoint is unprotected!');
   }
+});
+
+// Global error handlers — surface to console so Railway logs capture them
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason && reason.stack ? reason.stack : reason);
 });
