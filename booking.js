@@ -123,6 +123,153 @@ const logger = {
   error: (...args) => console.error(...args)
 };
 
+// Structured STEP logs are always emitted (not suppressed by --quiet)
+function step(msg) {
+  try { console.log('STEP: ' + String(msg)); } catch {}
+}
+
+// Emit an explicit ERROR: line for server parsing and Shortcut visibility
+function logError(key, message) {
+  try {
+    const tag = key ? String(key).replace(/\s+/g, '_') : 'error';
+    console.error('ERROR: ' + tag + (message ? ' - ' + String(message) : ''));
+    // also emit a STEP-level marker so we keep structured progress
+    step('error:' + tag);
+  } catch {}
+}
+
+// Diagnostics helpers: save page HTML + screenshot and attach simple network logging
+const DIAG_DIR = './diagnostics';
+function ensureDiagDir() {
+  try { if (!fs.existsSync(DIAG_DIR)) fs.mkdirSync(DIAG_DIR, { recursive: true }); } catch {}
+}
+
+async function savePageSnapshot(page, name = 'snapshot') {
+  try {
+    ensureDiagDir();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const base = `${DIAG_DIR}/${name}-${ts}`;
+    try { await page.screenshot({ path: base + '.png', fullPage: true }); } catch (e) { /* ignore */ }
+    try { await fs.promises.writeFile(base + '.html', await page.content()); } catch (e) { /* ignore */ }
+    console.log(C.yellow(`Saved diagnostics: ${base}.(html|png)`));
+    return base;
+  } catch (err) {
+    console.log('Failed to save page snapshot:', err && err.message ? err.message : err);
+    return null;
+  }
+}
+
+function attachPageDiagnostics(page) {
+  try {
+    page.on('response', async (res) => {
+      try {
+        const status = res.status();
+        if (status >= 400) {
+          const url = res.url();
+          const ct = res.headers()['content-type'] || '';
+          const msg = `NETWORK: ${status} on ${url} (content-type: ${ct})`;
+          console.warn(msg);
+          diagnosticsCollector.network.push({ type: 'response', status, url, contentType: ct, text: msg });
+          if (status === 429) {
+            logError('rate_limited', `HTTP 429 on ${url}`);
+            diagnosticsCollector.findings.push({ phrase: '429', snippet: `HTTP 429 on ${url}` });
+          }
+        }
+        // log Retry-After header if present
+        const ra = res.headers()['retry-after'];
+        if (ra) console.warn(`NETWORK: Retry-After=${ra} for ${res.url()}`);
+      } catch (e) {}
+    });
+
+    page.on('requestfailed', (req) => {
+      try {
+        const failure = req.failure();
+        const msg = `REQUEST FAILED: ${req.url()} - ${failure && failure.errorText ? failure.errorText : JSON.stringify(failure)}`;
+        console.warn(msg);
+        diagnosticsCollector.network.push({ type: 'requestfailed', url: req.url(), failure });
+      } catch (e) {}
+    });
+
+    page.on('console', async (msg) => {
+      try {
+        // capture page-side errors for extra context
+        if (msg.type() === 'error') {
+          const text = msg.text();
+          const out = `PAGE ERROR: ${text}`;
+          console.warn(out);
+          diagnosticsCollector.pageErrors.push({ text });
+        }
+      } catch (e) {}
+    });
+  } catch (err) {}
+}
+
+// Scan page HTML/text for common failure messages (rate limits, duplicates, waivers)
+async function scanForFailurePhrases(page) {
+  try {
+    const text = (await page.content()).toLowerCase();
+    const phrases = [
+      'rate limit', 'too many requests', '429', 'you may only', 'already have', 'only allowed',
+      'one reservation', 'per day', 'duplicate reservation', 'cannot complete', 'not allowed',
+      'please accept the', 'waiver', 'captcha', 'recaptcha', 'blocked'
+    ];
+    const found = [];
+    for (const p of phrases) {
+      const idx = text.indexOf(p);
+      if (idx !== -1) {
+        const snippet = text.substr(Math.max(0, idx - 60), 240).replace(/\s+/g, ' ').trim();
+        found.push({ phrase: p, snippet });
+        diagnosticsCollector.findings.push({ phrase: p, snippet });
+      }
+    }
+    return found;
+  } catch (err) { return []; }
+}
+
+// Simple diagnostics collector to aggregate events during a run
+const diagnosticsCollector = {
+  network: [],
+  pageErrors: [],
+  findings: [],
+};
+
+function explainIssues(findings, collector) {
+  const reasons = [];
+  const seen = new Set();
+  for (const f of findings || []) {
+    const p = (f.phrase || '').toLowerCase();
+    if (seen.has(p)) continue; seen.add(p);
+    if (p.includes('429') || p.includes('rate') || p.includes('too many requests')) {
+      reasons.push({ code: 'rate_limited', title: 'Rate limited (HTTP 429)', explain: 'The site is returning rate-limit responses. Reduce request frequency, add delays, or retry later. Check for Retry-After header for suggested wait time.' });
+    } else if (p.includes('captcha') || p.includes('recaptcha')) {
+      reasons.push({ code: 'captcha', title: 'Captcha / Bot protection', explain: 'The site is challenging automated requests with CAPTCHA or anti-bot measures. Manual intervention may be required to complete login/booking.' });
+    } else if (p.includes('waiver') || p.includes('please accept')) {
+      reasons.push({ code: 'waiver', title: 'Waiver / Agreement required', explain: 'A waiver or agreement must be accepted or scrolled before reservation can complete. Ensure the script checks the checkbox or accept it manually.' });
+    } else if (p.includes('duplicate') || p.includes('already have') || p.includes('one reservation') || p.includes('only allowed')) {
+      reasons.push({ code: 'duplicate', title: 'Duplicate / policy restriction', explain: 'You may already have a reservation or the site enforces limits (per day / per user). Confirm via the browser or adjust booking time.' });
+    } else if (p.includes('cannot complete') || p.includes('not allowed') || p.includes('cannot')) {
+      reasons.push({ code: 'cannot_complete', title: 'Operation blocked', explain: 'The server reports the action cannot be completed. Inspect the page or logs for more details.' });
+    } else {
+      reasons.push({ code: 'other', title: `Matched phrase: ${f.phrase}`, explain: f.snippet || '' });
+    }
+  }
+
+  // If no findings, inspect network errors for 5xx or other hints
+  if (reasons.length === 0 && collector && collector.network && collector.network.length) {
+    for (const n of collector.network.slice(-10)) {
+      if (n.status === 429) {
+        reasons.push({ code: 'rate_limited', title: 'Rate limited (HTTP 429)', explain: 'Recent network responses include HTTP 429 (Too Many Requests).' });
+        break;
+      }
+      if (n.status >= 500) {
+        reasons.push({ code: 'server_error', title: `Server error ${n.status}`, explain: `The server returned ${n.status} for ${n.url}` });
+        break;
+      }
+    }
+  }
+  return reasons;
+}
+
 /* ───────── helpers ───────── */
 
 function fmtDateTime(d) {
@@ -186,6 +333,7 @@ async function signIn(page) {
   // ── 1. Navigate to the login page ──
   console.log('Navigating to login page...');
   await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 120000 });
+  step('sign-in:navigate');
 
   // ── 2. Wait for the React SPA to render the form ──
   //    The SPA renders into #app-root. We wait for any visible input to appear.
@@ -601,6 +749,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   await page.waitForTimeout(5000);
   await page.waitForLoadState('load').catch(() => {});
   console.log('On reservation page (step 2) — filling in details...');
+  step('reservation:fill-details');
 
   // ── Step C: Page 2 — fill event name, select event type, check waiver, upload signature ──
 
@@ -804,6 +953,33 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           await page.waitForTimeout(150);
         }
         return true;
+
+    // After attempting to finish, check for common failure messages (rate limits, duplicate booking, waiver rejection)
+    try {
+      const failurePhrases = [
+        'you may only',
+        'already have',
+        'only allowed',
+        'one reservation',
+        'per day',
+        'duplicate reservation',
+        'cannot complete',
+        'not allowed',
+        'please accept the',
+        'waiver'
+      ];
+      const pageText = (await page.content()).toLowerCase();
+      for (const p of failurePhrases) {
+        if (pageText.indexOf(p) !== -1) {
+          const snippet = pageText.substr(Math.max(0, pageText.indexOf(p) - 40), 240).replace(/\s+/g, ' ').trim();
+          logError('rate_limited', snippet);
+          break;
+        }
+      }
+    } catch (err) {
+      // don't fail the whole run for diagnostics
+      console.log('Error scanning page for failure phrases:', err && err.message ? err.message : err);
+    }
       } catch { return false; }
     };
 
@@ -845,8 +1021,8 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       }
     }
 
-    if (checked > 0) console.log(`Checked ${checked} checkbox(es) (waiver/agreement).`);
-    else console.log('No unchecked checkboxes found (may already be checked or not present).');
+    if (checked > 0) { console.log(`Checked ${checked} checkbox(es) (waiver/agreement).`); step(`waiver:checked ${checked}`); }
+    else { console.log('No unchecked checkboxes found (may already be checked or not present).'); step('waiver:none'); }
   } catch (err) {
     console.log('Error checking waiver checkbox:', err.message || err);
   }
@@ -863,6 +1039,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
 
     if (canvasCount === 0) {
       console.log('No canvas found for signature — please sign manually.');
+      step('signature:not-found');
     } else {
       // Scroll canvas into view so it has a real bounding box
       await canvasLocator.scrollIntoViewIfNeeded().catch(() => {});
@@ -871,6 +1048,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const box = await canvasLocator.boundingBox();
       if (!box) {
         console.log('Canvas has no bounding box (possibly hidden) — please sign manually.');
+        step('signature:hidden');
       } else {
         // STEP A: If a signature image file exists, draw it onto the canvas visually first.
         if (signaturePath && fs.existsSync(signaturePath)) {
@@ -898,6 +1076,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
             });
           }, { dataUrl: imgDataUrl, w: box.width, h: box.height });
           console.log('Drew signature image onto canvas (visual layer).');
+          step('signature:drew-image');
         }
 
         // STEP B: Simulate a real pen stroke with Playwright's mouse API.
@@ -936,8 +1115,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
 
         if (isEmpty === false) {
           console.log('Signature registered by signature_pad (isEmpty = false).');
+          step('signature:registered');
         } else if (isEmpty === true) {
           console.log('Warning: signature_pad still reports isEmpty — attempting _data patch.');
+          step('signature:isEmpty');
           // Last-resort: directly inject a minimal stroke into _data so isEmpty() returns false
           await page.evaluate(() => {
             const canvas = document.querySelector('canvas');
@@ -949,6 +1130,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
             if (Array.isArray(sp._strokeData)) sp._strokeData = stub;
           });
           console.log('Patched signature_pad._data directly.');
+          step('signature:patched');
         } else {
           console.log('Signature drawn (canvas has content; instance not directly accessible).');
         }
@@ -1005,6 +1187,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
         await btn.click({ force: true });
         console.log(C.cyan(`Clicked: "${t}"`));
         submitted = true;
+        step('clicked:add-to-cart');
         break;
       }
     } catch {}
@@ -1057,6 +1240,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           await btn.click({ force: true });
           console.log(C.cyan(`Clicked: "${t}"`));
           await page.waitForTimeout(3000);
+          step('clicked:finish');
           break;
         }
       } catch {}
@@ -1071,6 +1255,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     try {
       if (await page.locator(`text=${txt}`).first().isVisible({ timeout: 1000 })) {
         console.log(C.green('\nBooking appears successful!'));
+        step('booking:appears-successful');
         break;
       }
     } catch {}
@@ -1148,10 +1333,12 @@ async function main() {
     viewport: { width: 1280, height: 900 }
   });
   const page = context.pages().length ? context.pages()[0] : await context.newPage();
+  // Attach diagnostics listeners to capture network errors, failed requests and page errors
+  attachPageDiagnostics(page);
 
    try {
-    // Step 1: Sign in FIRST
-    await signIn(page);
+     // Step 1: Sign in FIRST
+     await signIn(page);
 
     // If list-only flag provided, show filtered live rooms and exit
     if (ARGS.listOnly) {
@@ -1176,6 +1363,30 @@ async function main() {
 
   } catch (err) {
     console.error('Error:', err.message);
+    try {
+      // Save diagnostics snapshot for post-mortem
+      const base = await savePageSnapshot(page, 'error');
+      const found = await scanForFailurePhrases(page);
+      const reasons = explainIssues(found, diagnosticsCollector);
+
+      console.warn(C.red('\nError summary:'));
+      console.warn(`  Message: ${err.message}`);
+      if (base) console.warn(`  Saved diagnostics: ${base}.(html|png)`);
+      if (found && found.length) {
+        console.warn(C.yellow('\n  Detected notable text on page:'));
+        for (const f of found) console.warn(`    - ${f.phrase}: ${f.snippet}`);
+      }
+      if (reasons && reasons.length) {
+        console.warn(C.cyan('\n  Possible causes and explanations:'));
+        for (const r of reasons) {
+          console.warn(C.green(`    - ${r.title}: `) + `${r.explain}`);
+        }
+      } else {
+        console.warn('\n  No obvious failure phrases detected. Check the saved HTML/screenshot for details.');
+      }
+    } catch (e) {
+      console.error('Failed to collect diagnostics:', e && e.message ? e.message : e);
+    }
   }
 
   // Leave browser open so user can verify / intervene

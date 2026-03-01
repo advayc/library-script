@@ -66,8 +66,22 @@ function runBooking(date, capacity, onData, onDone) {
     cwd: __dirname,
   });
 
-  child.stdout.on('data', d => onData(d.toString()));
-  child.stderr.on('data', d => onData('[stderr] ' + d.toString()));
+  // sanitize output from child process (strip ANSI/control chars) so logs
+  // are safe to JSON-encode and view in tools like `jq`.
+  const sanitize = (s) => {
+    if (!s) return '';
+    let out = String(s);
+    // Remove ANSI escape sequences (colors, cursor movement, etc.)
+    out = out.replace(/\x1b\[[0-9;]*m/g, '');
+    // Remove other C0 control characters except newline and tab
+    out = out.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+    // Normalize CRLF to LF
+    out = out.replace(/\r\n?/g, '\n');
+    return out;
+  };
+
+  child.stdout.on('data', d => onData(sanitize(d.toString())));
+  child.stderr.on('data', d => onData(sanitize('[stderr] ' + d.toString())));
   child.on('close', code => onDone(code));
   child.on('error', err => {
     try {
@@ -138,14 +152,27 @@ const server = http.createServer(async (req, res) => {
     (async () => {
       try {
         job.status = 'running';
+        // immediate marker so clients see the job started even if child hasn't emitted output yet
+        job.log += 'STEP: job-started\n';
+        job.lastUpdated = Date.now();
         runBooking(date, capacity,
           (line) => { job.log += line; job.lastUpdated = Date.now(); },
           (code) => {
             job.exitCode = code;
             job.finishedAt = Date.now();
-            const summaryMatch = (job.log || '').match(/✔\s*(.+)/);
-            job.summary = summaryMatch ? summaryMatch[1].trim() : null;
-            job.status = (code === 0 || !!job.summary) ? 'done' : 'failed';
+            const log = job.log || '';
+            const summaryMatch = log.match(/✔\s*(.+)/);
+            const errorMatch = log.match(/^ERROR:\s*(.+)$/m);
+            if (errorMatch) {
+              job.summary = errorMatch[1].trim();
+              job.status = 'failed';
+            } else if (summaryMatch) {
+              job.summary = summaryMatch[1].trim();
+              job.status = 'done';
+            } else {
+              job.summary = null;
+              job.status = (code === 0) ? 'done' : 'failed';
+            }
           }
         );
       } catch (e) {
