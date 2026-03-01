@@ -16,3 +16,5 @@ Notes
 - The script uses Playwright UI automation. There is no public API for reservations.
 - You will likely need to inspect the site and update a few selectors in `scripts/book-room.js` under the "CUSTOMIZE SELECTORS" section.
 - If the site requires CAPTCHA/MFA during login, the script will pause and ask you to complete login manually in the browser window.
+
+This also uses a dockerized version of Playwright, so you can run it in a container if you prefer. See the Docker section below
