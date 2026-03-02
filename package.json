@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "book": "node booking.js",
-    "install-deps": "npm install playwright chrono-node inquirer dotenv"
+    "install-deps": "npm install playwright chrono-node inquirer dotenv",
+    "postinstall": "npx playwright install --with-deps"
   },
   "license": "MIT",
   "dependencies": {

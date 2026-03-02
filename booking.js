@@ -124,6 +124,43 @@ const logger = {
   error: (...args) => console.error(...args)
 };
 
+// Declutter console: color important lines and suppress noisy output unless --debug
+(() => {
+  const origLog = console.log.bind(console);
+  const origWarn = console.warn.bind(console);
+  const origError = console.error.bind(console);
+
+  function joinArgs(args) {
+    return args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  }
+
+  function isImportant(msg) {
+    return /^(STEP:|ERROR:|✔|Parsed time:|Reservation flow completed|Browser left open)/.test(msg);
+  }
+
+  console.log = (...args) => {
+    const msg = joinArgs(args);
+    if (ARGS.quiet && !isImportant(msg)) return;
+    if (!ARGS.debug && /DEBUG:/.test(msg)) return;
+    if (/^STEP:/.test(msg)) { origLog(C.cyan(msg)); return; }
+    if (/^ERROR:/.test(msg)) { origError(C.red(msg)); return; }
+    if (/^✔/.test(msg) || /Parsed time:/.test(msg) || /Booking appears successful!/.test(msg)) { origLog(C.green(msg)); return; }
+    // default: show only when not quiet; non-debug messages are yellow
+    origLog(ARGS.debug ? msg : C.yellow(msg));
+  };
+
+  console.warn = (...args) => {
+    const msg = joinArgs(args);
+    if (ARGS.quiet && !isImportant(msg)) return;
+    origWarn(C.yellow(msg));
+  };
+
+  console.error = (...args) => {
+    const msg = joinArgs(args);
+    origError(C.red(msg));
+  };
+})();
+
 // Structured STEP logs are always emitted (not suppressed by --quiet)
 function step(msg) {
   try { console.log('STEP: ' + String(msg)); } catch {}
@@ -340,7 +377,7 @@ async function signIn(page) {
   //    The SPA renders into #app-root. We wait for any visible input to appear.
   console.log('Waiting for login form to render...');
   try {
-    await page.waitForSelector('input', { state: 'visible', timeout: 30000 });
+    await page.waitForSelector('input', { state: 'visible', timeout: 15000 });
   } catch {
     console.log('Login form did not appear in time. Checking if already logged in...');
     // If "Sign Out" or "My Account" is visible, we're already logged in
@@ -479,9 +516,9 @@ async function signIn(page) {
   // Wait for navigation or for the "Sign Out" / "My Account" text to appear
   // (indicates successful login). The site may redirect across domains.
   try {
-    await page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => {});
+    await page.waitForNavigation({ waitUntil: 'load', timeout: 5000 }).catch(() => {});
   } catch {}
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(300);
 
     // reCAPTCHA may have triggered — check if we're still on the login page
     if (await isLoggedIn(page)) {
@@ -501,8 +538,8 @@ async function isLoggedIn(page) {
   try {
     const signOut = page.locator('text=Sign Out').first();
     const myAccount = page.locator('text=My Account').first();
-    if (await signOut.isVisible({ timeout: 1000 })) return true;
-    if (await myAccount.isVisible({ timeout: 1000 })) return true;
+    if (await signOut.isVisible({ timeout: 600 })) return true;
+    if (await myAccount.isVisible({ timeout: 600 })) return true;
   } catch {}
   return false;
 }
@@ -518,15 +555,20 @@ async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
 
   // Wait for the SPA to render results
   console.log('Waiting for results to load...');
-  await page.waitForTimeout(4000);
+  // Shorter wait: prefer waiting for results container if present
+  try {
+       await page.waitForSelector('div.card-package__card.item-searched', { timeout: 300 });
+  } catch {
+    await page.waitForTimeout(300);
+  }
 
   // Click "Search" button if present (sometimes needed to trigger the query)
   const searchBtn = page.locator('button:has-text("Search")').first();
   try {
-    if (await searchBtn.isVisible({ timeout: 2000 })) {
+    if (await searchBtn.isVisible({ timeout: 800 })) {
       await searchBtn.click();
       console.log('Clicked Search button.');
-      await page.waitForTimeout(4000);
+      try { await page.waitForSelector('div.card-package__card.item-searched', { timeout: 300 }); } catch { await page.waitForTimeout(100); }
     }
   } catch {}
 
@@ -650,7 +692,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     // Use Promise.race: either navigation fires, or we time out after 10s
     // (SPA may do a pushState without a full navigation event)
     await Promise.race([
-      page.waitForNavigation({ waitUntil: 'load', timeout: 10000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: 'load', timeout: 4000 }).catch(() => {}),
       (async () => {
         await room.cardHandle.click();
       })()
@@ -658,7 +700,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   } catch {}
 
   // Give the SPA extra time to settle after click + possible pushState
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(250);
   await page.waitForLoadState('load').catch(() => {});
 
   const currentUrl = page.url();
@@ -691,7 +733,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of plusSelectors) {
       try {
         const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 1500 })) { plusBtn = el; break; }
+        if (await el.isVisible({ timeout: 600 })) { plusBtn = el; break; }
       } catch {}
     }
 
@@ -699,7 +741,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const clicks = Math.max(0, want - 1);
       for (let i = 0; i < clicks; i++) {
         await plusBtn.click();
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(30);
       }
       console.log(`Clicked + ${clicks} time(s) to reach ${want} attendee(s).`);
     } else {
@@ -718,7 +760,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Click "Proceed" to move to step 2
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(100);
   const proceedSelectors = [
     'button:has-text("Proceed")',
     'button:has-text("Continue")',
@@ -732,7 +774,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   for (const sel of proceedSelectors) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 1500 })) {
+      if (await btn.isVisible({ timeout: 600 })) {
         const t = (await btn.innerText()).trim();
         await btn.click();
         console.log(C.cyan(`Clicked: "${t}"`));
@@ -747,7 +789,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Wait for page 2 to load
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(250);
   await page.waitForLoadState('load').catch(() => {});
   console.log('On reservation page (step 2) — filling in details...');
   step('reservation:fill-details');
@@ -774,7 +816,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of nameSelectors) {
       try {
         const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 1000 })) {
+        if (await el.isVisible({ timeout: 600 })) {
           await el.click();
           await el.fill('Study Room Booking');
           console.log(`Filled event name using "${sel}".`);
@@ -815,7 +857,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const combos = await page.locator('div.dropdown[role="combobox"], [role="combobox"]').all();
       for (const combo of combos) {
         try {
-          if (!await combo.isVisible({ timeout: 500 }).catch(() => false)) continue;
+          if (!await combo.isVisible({ timeout: 300 }).catch(() => false)) continue;
           const aria = (await combo.getAttribute('aria-label')) || '';
           const btnText = (await combo.evaluate(n => {
             const b = n.querySelector('.dropdown__button, .dropdown__button-text');
@@ -825,10 +867,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
 
           // Open the dropdown
           const button = combo.locator('.dropdown__button').first();
-          if (await button.count() && await button.isVisible({ timeout: 1000 })) {
+          if (await button.count() && await button.isVisible({ timeout: 600 })) {
             await button.click();
             // wait for expanded state or options to appear
-            await page.waitForTimeout(300);
+            await page.waitForTimeout(30);
             const listId = await combo.getAttribute('aria-controls');
             let opt = null;
             if (listId) {
@@ -836,7 +878,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
             } else {
               opt = combo.locator('ul li[role="option"]').first();
             }
-            if (opt && await opt.count() && await opt.isVisible({ timeout: 2000 })) {
+            if (opt && await opt.count() && await opt.isVisible({ timeout: 800 })) {
               await opt.click();
               console.log('Selected event type via custom dropdown.');
               selected = true;
@@ -860,7 +902,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       for (const sel of typeSelectors) {
         try {
           const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 1000 })) {
+            if (await el.isVisible({ timeout: 600 })) {
             const options = await el.locator('option').all();
             let firstVal = null;
             for (const opt of options) {
@@ -889,7 +931,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
         const allSelects = await page.locator('select').all();
         for (const sel of allSelects) {
           try {
-            if (!await sel.isVisible({ timeout: 500 })) continue;
+            if (!await sel.isVisible({ timeout: 300 })) continue;
             const opts = await sel.locator('option').all();
             if (opts.length > 1) { await sel.selectOption({ index: 1 }); console.log('Selected first option in fallback select.'); selected = true; break; }
           } catch {}
@@ -902,7 +944,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     console.log('Error selecting event type:', err.message || err);
   }
 
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(40);
 
   // 3) Check waiver / agreement checkboxes
   // Uses the React nativeInputValueSetter trick so the framework sees the state change.
@@ -912,10 +954,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     // First: scroll any waiver text containers to the bottom (some sites require this before the checkbox activates)
     try {
       const scrollables = await page.locator('.waiver, .waiver-text, .agreement-text, [class*="waiver"], [class*="agreement"], [class*="terms"]').all();
-      for (const el of scrollables) {
+          for (const el of scrollables) {
         try {
           await el.evaluate(n => { n.scrollTop = n.scrollHeight; });
-          await page.waitForTimeout(200);
+          await page.waitForTimeout(20);
         } catch {}
       }
     } catch {}
@@ -924,7 +966,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     const forceCheckCheckbox = async (cb) => {
       try {
         await cb.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(20);
 
         // Use nativeInputValueSetter so React's synthetic event system sees the change
         await cb.evaluate(el => {
@@ -936,22 +978,22 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           el.dispatchEvent(new Event('change', { bubbles: true }));
           el.dispatchEvent(new Event('input',  { bubbles: true }));
         });
-        await page.waitForTimeout(150);
+        await page.waitForTimeout(15);
 
         // Also do a real Playwright click after so any non-React listeners fire too
         const cbId = await cb.getAttribute('id').catch(() => null);
-        if (cbId) {
+          if (cbId) {
           const lbl = page.locator(`label[for="${cbId}"]`).first();
-          if (await lbl.count() && await lbl.isVisible({ timeout: 300 }).catch(() => false)) {
+          if (await lbl.count() && await lbl.isVisible({ timeout: 150 }).catch(() => false)) {
             await lbl.click({ force: true });
-            await page.waitForTimeout(150);
+            await page.waitForTimeout(15);
           } else {
             await cb.click({ force: true });
-            await page.waitForTimeout(150);
+            await page.waitForTimeout(15);
           }
         } else {
           await cb.click({ force: true });
-          await page.waitForTimeout(150);
+          await page.waitForTimeout(15);
         }
         return true;
 
@@ -993,7 +1035,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
         'input[type="checkbox"][value="agree"]'
       ).all();
       for (const cb of waivers) {
-        if (!await cb.isVisible({ timeout: 300 }).catch(() => false)) continue;
+        if (!await cb.isVisible({ timeout: 150 }).catch(() => false)) continue;
         if (await forceCheckCheckbox(cb)) checked++;
       }
     } catch {}
@@ -1003,7 +1045,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const checkboxes = await page.locator('input[type="checkbox"]').all();
       for (const cb of checkboxes) {
         try {
-          if (!await cb.isVisible({ timeout: 300 }).catch(() => false)) continue;
+          if (!await cb.isVisible({ timeout: 150 }).catch(() => false)) continue;
           if (await forceCheckCheckbox(cb)) checked++;
         } catch {}
       }
@@ -1014,7 +1056,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const roleCheckboxes = await page.locator('[role="checkbox"]').all();
       for (const el of roleCheckboxes) {
         try {
-          if (!await el.isVisible({ timeout: 300 }).catch(() => false)) continue;
+          if (!await el.isVisible({ timeout: 150 }).catch(() => false)) continue;
           await el.evaluate(n => n.scrollIntoView({ block: 'center', behavior: 'instant' }));
           await el.click({ force: true });
           checked++;
@@ -1029,7 +1071,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Give the framework time to register the waiver state
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(30);
 
   // 4) Draw signature onto canvas using Playwright's real mouse API.
   //    signature_pad listens to PointerEvents — only page.mouse generates real ones.
@@ -1044,7 +1086,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     } else {
       // Scroll canvas into view so it has a real bounding box
       await canvasLocator.scrollIntoViewIfNeeded().catch(() => {});
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(30);
 
       const box = await canvasLocator.boundingBox();
       if (!box) {
@@ -1095,10 +1137,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           const px = cx - box.width * 0.3 + t * box.width * 0.6;
           const py = cy + box.height * 0.1 - Math.sin(t * Math.PI) * box.height * 0.35;
           await page.mouse.move(px, py);
-          await page.waitForTimeout(8);
+          await page.waitForTimeout(2);
         }
         await page.mouse.up();
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(30);
 
         // Verify the signature pad registered the stroke
         const isEmpty = await page.evaluate(() => {
@@ -1155,7 +1197,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     console.log('Error drawing signature:', err.message || err);
   }
 
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(40);
 
   // 5) Click "Add to Cart" (or equivalent) on page 2
   // Prioritise "Add to Cart" variants first; fall back to other submit buttons.
@@ -1174,11 +1216,11 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   for (const sel of submitSelectors) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 1500 })) {
+      if (await btn.isVisible({ timeout: 600 })) {
         const t = (await btn.innerText()).trim();
         // Scroll into view and wait briefly so any pending validation settles
         await btn.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(100);
         // Check the button is not disabled before clicking
         const isDisabled = await btn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true').catch(() => false);
         if (isDisabled) {
@@ -1198,7 +1240,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // 6) Wait for cart page to load, then click "Finish" to complete the order
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(1500);
   try {
     // Wait until we're on a cart/checkout page
     await page.waitForURL(/cart|checkout|shopping/i, { timeout: 8000 }).catch(() => {});
@@ -1219,7 +1261,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of finishSelectors) {
       try {
         const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 1500 })) {
+        if (await btn.isVisible({ timeout: 600 })) {
           // Safely obtain button text or fallback to its value or selector string
           let t = String(sel);
           try {
@@ -1237,10 +1279,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           }
 
           await btn.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-          await page.waitForTimeout(400);
+          await page.waitForTimeout(100);
           await btn.click({ force: true });
           console.log(C.cyan(`Clicked: "${t}"`));
-          await page.waitForTimeout(3000);
+          await page.waitForTimeout(800);
           step('clicked:finish');
           break;
         }
@@ -1254,7 +1296,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   const successTexts = ['Reservation Confirmed', 'Reservation Complete', 'Thank you', 'Confirmation', 'Success', 'has been added', 'receipt', 'Shopping Cart'];
   for (const txt of successTexts) {
     try {
-      if (await page.locator(`text=${txt}`).first().isVisible({ timeout: 1000 })) {
+      if (await page.locator(`text=${txt}`).first().isVisible({ timeout: 400 })) {
         console.log(C.green('\nBooking appears successful!'));
         step('booking:appears-successful');
         break;

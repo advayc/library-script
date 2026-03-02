@@ -95,6 +95,48 @@ function runBooking(date, capacity, onData, onDone) {
 const jobs = new Map();
 let jobCounter = 0;
 
+// --- queued runner with concurrency control to avoid parallel heavyweight
+// Playwright launches. Set MAX_CONCURRENT_BOOKINGS to control throughput.
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_BOOKINGS) || 1;
+const jobQueue = [];
+let runningCount = 0;
+
+function processQueue() {
+  if (runningCount >= MAX_CONCURRENT) return;
+  if (jobQueue.length === 0) return;
+  const job = jobQueue.shift();
+  if (!job) return;
+  runningCount++;
+  job.status = 'running';
+  job.log += 'STEP: job-started\n';
+  job.lastUpdated = Date.now();
+
+  runBooking(job.date, job.capacity,
+    (line) => { job.log += line; job.lastUpdated = Date.now(); },
+    (code) => {
+      job.exitCode = code;
+      job.finishedAt = Date.now();
+      const log = job.log || '';
+      const summaryMatch = log.match(/✔\s*(.+)/);
+      const errorMatch = log.match(/^ERROR:\s*(.+)$/m);
+      if (errorMatch) {
+        job.summary = errorMatch[1].trim();
+        job.status = 'failed';
+      } else if (summaryMatch) {
+        job.summary = summaryMatch[1].trim();
+        job.status = 'done';
+      } else {
+        job.summary = null;
+        job.status = (code === 0) ? 'done' : 'failed';
+      }
+      runningCount--;
+      job.lastUpdated = Date.now();
+      // Continue processing queued jobs
+      setImmediate(processQueue);
+    }
+  );
+}
+
 
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {
@@ -148,39 +190,10 @@ const server = http.createServer(async (req, res) => {
     };
     jobs.set(jobId, job);
 
-    // Start processing in background
-    (async () => {
-      try {
-        job.status = 'running';
-        // immediate marker so clients see the job started even if child hasn't emitted output yet
-        job.log += 'STEP: job-started\n';
-        job.lastUpdated = Date.now();
-        runBooking(date, capacity,
-          (line) => { job.log += line; job.lastUpdated = Date.now(); },
-          (code) => {
-            job.exitCode = code;
-            job.finishedAt = Date.now();
-            const log = job.log || '';
-            const summaryMatch = log.match(/✔\s*(.+)/);
-            const errorMatch = log.match(/^ERROR:\s*(.+)$/m);
-            if (errorMatch) {
-              job.summary = errorMatch[1].trim();
-              job.status = 'failed';
-            } else if (summaryMatch) {
-              job.summary = summaryMatch[1].trim();
-              job.status = 'done';
-            } else {
-              job.summary = null;
-              job.status = (code === 0) ? 'done' : 'failed';
-            }
-          }
-        );
-      } catch (e) {
-        job.status = 'failed';
-        job.log += `\n[server error] ${e.message}`;
-        job.finishedAt = Date.now();
-      }
-    })();
+    // Enqueue the job for controlled processing. Runner (processQueue)
+    // will pick it up respecting MAX_CONCURRENT.
+    jobQueue.push(job);
+    processQueue();
 
     res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ jobId, statusUrl: `/status/${jobId}` }));
